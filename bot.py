@@ -21,6 +21,11 @@ def webhook():
     bot.process_new_updates([update])
     return 'ok'
 
+@app.route('/', methods=['GET'])
+def health_check():
+    send_forecast()  # Отправляем прогноз при каждом пинге от UptimeRobot
+    return 'OK'
+
 def load_subscribers():
     try:
         if os.path.exists(SUBSCRIBERS_FILE):
