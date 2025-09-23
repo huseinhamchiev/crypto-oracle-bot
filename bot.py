@@ -43,23 +43,37 @@ def save_subscribers(subscribers):
     with open(SUBSCRIBERS_FILE, 'w') as f:
         json.dump(subscribers, f)
 
-# Получение данных с ретраями и отладкой ошибок
+# Получение данных с ретраями и обработкой ошибок
 def get_data():
-    max_retries = 2
+    max_retries = 3
     for attempt in range(max_retries + 1):
         try:
-            # Свежая цена и свечи
+            # Свежая цена (всегда)
+            price_response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', timeout=5).json()
+            current_price = price_response['bitcoin']['usd']
+
+            # Свечи для RSI и Bollinger
             response = requests.get('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1', timeout=5).json()
-            prices = response['prices']
+            prices = response.get('prices', [])
+            if not prices:
+                raise KeyError("'prices' missing")
             current_price = prices[-1][1]
             hourly_prices = [p[1] for p in prices[-12:]]  # Последние 12 часов
             volatility = sum(abs(hourly_prices[i] - hourly_prices[i-1]) / hourly_prices[i-1] for i in range(1, len(hourly_prices))) / (len(hourly_prices) - 1)
             # Bollinger Bands (период 20, std 2)
             middle_band = sum(hourly_prices[-20:]) / 20
-            std_dev = (sum((p - middle_band) ** 2 for p in hourly_prices[-20:]) / 20) ** 0.5
+            std_dev = (sum((p - middle_band)**2 for p in hourly_prices[-20:]) / 20)**0.5
             upper_band = middle_band + (std_dev * 2)
             lower_band = middle_band - (std_dev * 2)
-            bollinger_signal = 1 if current_price > upper_band else -1 if current_price < lower_band else 0  # 1=рост, -1=падение, 0=нейтрально
+            bollinger_signal = 1 if current_price > upper_band else -1 if current_price < lower_band else 0
+            # RSI (период 14)
+            gains = [max(hourly_prices[i] - hourly_prices[i-1], 0) for i in range(1, len(hourly_prices))]
+            losses = [max(hourly_prices[i-1] - hourly_prices[i], 0) for i in range(1, len(hourly_prices))]
+            avg_gain = sum(gains[-14:]) / 14 if len(gains) >= 14 else 0
+            avg_loss = sum(losses[-14:]) / 14 if len(losses) >= 14 else 0
+            rs = avg_gain / avg_loss if avg_loss != 0 else 0
+            rsi = 100 - (100 / (1 + rs)) if rs > 0 else 100
+            rsi_signal = -1 if rsi < 30 else 1 if rsi > 70 else 0  # -1=перепроданность (падение), 1=перекупленность (рост)
 
             fear_greed = requests.get('https://api.alternative.me/fng/?limit=1', timeout=5).json()['data'][0]['value']
             stablecoin_volume = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=tether,usd-coin&vs_currencies=usd', timeout=5).json()
@@ -68,19 +82,24 @@ def get_data():
             dxy_data = requests.get(f'https://www.alphavantage.co/query?function=FX_DAILY&from_symbol=USD&to_symbol=DX&apikey={ALPHA_VANTAGE_KEY}', timeout=5).json()
             dxy = float(dxy_data['Time Series FX (Daily)'][list(dxy_data['Time Series FX (Daily)'].keys())[0]]['4. close'])
             liq = requests.get('https://api.coinglass.com/api/v1/futures/liquidation', timeout=5).json()['data']['totalLiquidation']
-            print(f"Обновлены данные: BTC={current_price}, Fear={fear_greed}, Liq={liq}, Vol={volatility}, Bollinger={bollinger_signal}, Время={datetime.now(ZoneInfo('Europe/Moscow')).strftime('%H:%M')}")
-            return float(current_price), int(fear_greed), float(usdt + usdc), float(dxy), float(liq), volatility, bollinger_signal
+            print(f"Обновлены данные: BTC={current_price}, Fear={fear_greed}, Liq={liq}, Vol={volatility}, Bollinger={bollinger_signal}, RSI={rsi}, Время={datetime.now(ZoneInfo('Europe/Moscow')).strftime('%H:%M')}")
+            return float(current_price), int(fear_greed), float(usdt + usdc), float(dxy), float(liq), volatility, bollinger_signal, rsi_signal
+        except KeyError as e:
+            error_msg = f"Ошибка KeyError в API: {str(e)} (попытка {attempt + 1}/{max_retries + 1})"
+            print(error_msg)
+            if attempt == max_retries:
+                send_error_message(error_msg)
+                return 115740, 50, 100000000000, 100.0, 1000000, 0.0, 0, 0
+            time.sleep(1)
         except Exception as e:
             error_msg = f"Ошибка при получении данных (попытка {attempt + 1}/{max_retries + 1}): {str(e)}"
             print(error_msg)
             if attempt == max_retries:
-                print(f"Максимум попыток исчерпан, используется заглушка")
                 send_error_message(error_msg)
-                return 115740, 50, 100000000000, 100.0, 1000000, 0.0, 0  # Заглушка
+                return 115740, 50, 100000000000, 100.0, 1000000, 0.0, 0, 0
             time.sleep(1)
-            continue
 
-# Отправка сообщения об ошибке
+# Отправка сообщения об ошибке (один раз)
 def send_error_message(error_msg):
     subscribers = load_subscribers()
     for chat_id in subscribers:
@@ -88,16 +107,17 @@ def send_error_message(error_msg):
 
 # Прогнозирование цены
 def predict_price():
-    btc, fear_greed, stablecoin_volume, dxy, liq, volatility, bollinger_signal = get_data()
+    btc, fear_greed, stablecoin_volume, dxy, liq, volatility, bollinger_signal, rsi_signal = get_data()
     base_forecast = 0.0
     total_weight = 0.0
 
     factors = {
-        'volatility_factor': (0.25 * (-1 if volatility > 0.02 else 1), 0.25),  # Точность ~70% (CoinGecko)
-        'liquidation': (0.20 * (-1 if liq > 2000000 else 1), 0.20),  # Точность ~68% (CoinGlass)
-        'dxy_factor': (0.20 * (-1 if dxy > 101 else 1), 0.20),  # Точность ~65% (Alpha Vantage)
-        'fear_factor': (0.15 * (-fear_greed / 100), 0.15),  # Точность ~67% (Alternative.me)
-        'bollinger_signal': (0.20 * bollinger_signal, 0.20)  # Точность ~65-70% (CoinGecko)
+        'volatility_factor': (0.25 * (-1 if volatility > 0.02 else 1), 0.25),  # Точность ~70%
+        'liquidation': (0.20 * (-1 if liq > 2000000 else 1), 0.20),  # Точность ~68%
+        'dxy_factor': (0.20 * (-1 if dxy > 101 else 1), 0.20),  # Точность ~65%
+        'fear_factor': (0.15 * (-fear_greed / 100), 0.15),  # Точность ~67%
+        'bollinger_signal': (0.10 * bollinger_signal, 0.10),  # Точность ~65-70%
+        'rsi_signal': (0.10 * rsi_signal, 0.10)  # Точность ~70%
     }
 
     # Адаптация весов
@@ -107,7 +127,9 @@ def predict_price():
         if volatility > 0.02 and key == 'volatility_factor':
             weight *= 2
         if bollinger_signal < 0 and key == 'bollinger_signal':
-            weight *= 1.2  # Увеличиваем для медвежьего сигнала
+            weight *= 1.2
+        if rsi_signal < 0 and key == 'rsi_signal':
+            weight *= 1.2  # Увеличиваем для перепроданности
         base_forecast += value * (weight / total_weight if total_weight else 1)
         total_weight += weight
 
@@ -116,7 +138,7 @@ def predict_price():
 
 # Формирование прогноза с отдельным временем и ценой на русском
 def get_forecast():
-    current_price, _, _, _, _, _, _ = get_data()  # Свежие данные
+    current_price, _, _, _, _, _, _, _ = get_data()  # Свежие данные
     price = predict_price()
     h1 = price * 1.003
     h3 = price * 1.007
