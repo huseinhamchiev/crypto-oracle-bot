@@ -11,6 +11,8 @@ from flask import Flask, request
 BOT_TOKEN = '8454820081:AAFTjnT2oyyWmX0J8PLQmcDE0tC82TFcJKw'
 ALPHA_VANTAGE_KEY = 'TNRGDW0XZE622EKD'
 SUBSCRIBERS_FILE = 'subscribers.json'
+COINGECKO_URL = 'https://api.coingecko.com/api/v3'
+COINMARKETCAP_URL = 'https://pro-api.coinmarketcap.com/v1'
 
 # Инициализация
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -43,21 +45,21 @@ def save_subscribers(subscribers):
     with open(SUBSCRIBERS_FILE, 'w') as f:
         json.dump(subscribers, f)
 
-# Получение данных с ретраями и обработкой ошибок
+# Получение данных с переключением источников
 def get_data():
     max_retries = 3
+    use_coinmarketcap = False
+
     for attempt in range(max_retries + 1):
         try:
-            # Свежая цена (всегда)
-            price_response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', timeout=5).json()
+            # Попытка получить данные из CoinGecko
+            price_response = requests.get(f'{COINGECKO_URL}/simple/price?ids=bitcoin&vs_currencies=usd', timeout=5).json()
             current_price = price_response['bitcoin']['usd']
 
-            # Свечи для RSI и Bollinger
-            response = requests.get('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1', timeout=5).json()
+            response = requests.get(f'{COINGECKO_URL}/coins/bitcoin/market_chart?vs_currency=usd&days=1', timeout=5).json()
             prices = response.get('prices', [])
             if not prices:
-                raise KeyError("'prices' missing")
-            current_price = prices[-1][1]
+                raise KeyError("'prices' missing from CoinGecko")
             hourly_prices = [p[1] for p in prices[-12:]]  # Последние 12 часов
             volatility = sum(abs(hourly_prices[i] - hourly_prices[i-1]) / hourly_prices[i-1] for i in range(1, len(hourly_prices))) / (len(hourly_prices) - 1)
             # Bollinger Bands (период 20, std 2)
@@ -73,24 +75,56 @@ def get_data():
             avg_loss = sum(losses[-14:]) / 14 if len(losses) >= 14 else 0
             rs = avg_gain / avg_loss if avg_loss != 0 else 0
             rsi = 100 - (100 / (1 + rs)) if rs > 0 else 100
-            rsi_signal = -1 if rsi < 30 else 1 if rsi > 70 else 0  # -1=перепроданность (падение), 1=перекупленность (рост)
+            rsi_signal = -1 if rsi < 30 else 1 if rsi > 70 else 0
 
             fear_greed = requests.get('https://api.alternative.me/fng/?limit=1', timeout=5).json()['data'][0]['value']
-            stablecoin_volume = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=tether,usd-coin&vs_currencies=usd', timeout=5).json()
-            usdt = stablecoin_volume['tether']['usd']
-            usdc = stablecoin_volume['usd-coin']['usd']
             dxy_data = requests.get(f'https://www.alphavantage.co/query?function=FX_DAILY&from_symbol=USD&to_symbol=DX&apikey={ALPHA_VANTAGE_KEY}', timeout=5).json()
             dxy = float(dxy_data['Time Series FX (Daily)'][list(dxy_data['Time Series FX (Daily)'].keys())[0]]['4. close'])
             liq = requests.get('https://api.coinglass.com/api/v1/futures/liquidation', timeout=5).json()['data']['totalLiquidation']
-            print(f"Обновлены данные: BTC={current_price}, Fear={fear_greed}, Liq={liq}, Vol={volatility}, Bollinger={bollinger_signal}, RSI={rsi}, Время={datetime.now(ZoneInfo('Europe/Moscow')).strftime('%H:%M')}")
-            return float(current_price), int(fear_greed), float(usdt + usdc), float(dxy), float(liq), volatility, bollinger_signal, rsi_signal
-        except KeyError as e:
-            error_msg = f"Ошибка KeyError в API: {str(e)} (попытка {attempt + 1}/{max_retries + 1})"
-            print(error_msg)
-            if attempt == max_retries:
-                send_error_message(error_msg)
-                return 115740, 50, 100000000000, 100.0, 1000000, 0.0, 0, 0
-            time.sleep(1)
+            source = "CoinGecko"
+            break
+
+        except (KeyError, requests.RequestException):
+            # Переключение на CoinMarketCap
+            if not use_coinmarketcap:
+                try:
+                    headers = {'Accept': 'application/json'}
+                    price_response = requests.get(f'{COINMARKETCAP_URL}/cryptocurrency/quotes/latest?symbol=BTC', headers=headers, timeout=5).json()
+                    current_price = price_response['data']['BTC']['quote']['USD']['price']
+
+                    historical_response = requests.get(f'{COINMARKETCAP_URL}/v2/cryptocurrency/historical-data?coin=BTC&time_period=1d', headers=headers, timeout=5).json()
+                    prices = [(entry['time_close'], entry['quote']['USD']['close']) for entry in historical_response['data']['quotes']]
+                    prices = sorted(prices, key=lambda x: x[0], reverse=True)
+                    hourly_prices = [p[1] for p in prices[:12]]  # Последние 12 часов
+                    volatility = sum(abs(hourly_prices[i] - hourly_prices[i-1]) / hourly_prices[i-1] for i in range(1, len(hourly_prices))) / (len(hourly_prices) - 1)
+                    # Bollinger Bands
+                    middle_band = sum(hourly_prices[-20:]) / 20
+                    std_dev = (sum((p - middle_band)**2 for p in hourly_prices[-20:]) / 20)**0.5
+                    upper_band = middle_band + (std_dev * 2)
+                    lower_band = middle_band - (std_dev * 2)
+                    bollinger_signal = 1 if current_price > upper_band else -1 if current_price < lower_band else 0
+                    # RSI
+                    gains = [max(hourly_prices[i] - hourly_prices[i-1], 0) for i in range(1, len(hourly_prices))]
+                    losses = [max(hourly_prices[i-1] - hourly_prices[i], 0) for i in range(1, len(hourly_prices))]
+                    avg_gain = sum(gains[-14:]) / 14 if len(gains) >= 14 else 0
+                    avg_loss = sum(losses[-14:]) / 14 if len(losses) >= 14 else 0
+                    rs = avg_gain / avg_loss if avg_loss != 0 else 0
+                    rsi = 100 - (100 / (1 + rs)) if rs > 0 else 100
+                    rsi_signal = -1 if rsi < 30 else 1 if rsi > 70 else 0
+
+                    fear_greed = requests.get('https://api.alternative.me/fng/?limit=1', timeout=5).json()['data'][0]['value']
+                    dxy_data = requests.get(f'https://www.alphavantage.co/query?function=FX_DAILY&from_symbol=USD&to_symbol=DX&apikey={ALPHA_VANTAGE_KEY}', timeout=5).json()
+                    dxy = float(dxy_data['Time Series FX (Daily)'][list(dxy_data['Time Series FX (Daily)'].keys())[0]]['4. close'])
+                    liq = requests.get('https://api.coinglass.com/api/v1/futures/liquidation', timeout=5).json()['data']['totalLiquidation']
+                    source = "CoinMarketCap"
+                    break
+                except (KeyError, requests.RequestException):
+                    if attempt == max_retries - 1:
+                        use_coinmarketcap = True
+                    continue
+            else:
+                raise Exception("Both sources failed")
+
         except Exception as e:
             error_msg = f"Ошибка при получении данных (попытка {attempt + 1}/{max_retries + 1}): {str(e)}"
             print(error_msg)
@@ -99,7 +133,10 @@ def get_data():
                 return 115740, 50, 100000000000, 100.0, 1000000, 0.0, 0, 0
             time.sleep(1)
 
-# Отправка сообщения об ошибке (один раз)
+    print(f"Обновлены данные: BTC={current_price}, Fear={fear_greed}, Liq={liq}, Vol={volatility}, Bollinger={bollinger_signal}, RSI={rsi}, Источник={source}, Время={datetime.now(ZoneInfo('Europe/Moscow')).strftime('%H:%M')}")
+    return float(current_price), int(fear_greed), 100000000000, float(dxy), float(liq), volatility, bollinger_signal, rsi_signal
+
+# Отправка сообщения об ошибке
 def send_error_message(error_msg):
     subscribers = load_subscribers()
     for chat_id in subscribers:
@@ -136,7 +173,7 @@ def predict_price():
     forecast = base_forecast / btc if total_weight else 0.0
     return btc + forecast * btc
 
-# Формирование прогноза с отдельным временем и ценой на русском
+# Формирование прогноза
 def get_forecast():
     current_price, _, _, _, _, _, _, _ = get_data()  # Свежие данные
     price = predict_price()
