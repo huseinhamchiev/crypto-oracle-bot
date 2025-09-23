@@ -43,7 +43,7 @@ def save_subscribers(subscribers):
     with open(SUBSCRIBERS_FILE, 'w') as f:
         json.dump(subscribers, f)
 
-# Получение свежих данных (без кэша, с ретраями)
+# Получение данных с ретраями и отладкой ошибок
 def get_data():
     max_retries = 2
     for attempt in range(max_retries + 1):
@@ -68,14 +68,23 @@ def get_data():
             dxy_data = requests.get(f'https://www.alphavantage.co/query?function=FX_DAILY&from_symbol=USD&to_symbol=DX&apikey={ALPHA_VANTAGE_KEY}', timeout=5).json()
             dxy = float(dxy_data['Time Series FX (Daily)'][list(dxy_data['Time Series FX (Daily)'].keys())[0]]['4. close'])
             liq = requests.get('https://api.coinglass.com/api/v1/futures/liquidation', timeout=5).json()['data']['totalLiquidation']
-            print(f"Updated data: BTC={current_price}, Fear={fear_greed}, Liq={liq}, Vol={volatility}, Bollinger={bollinger_signal}, Time={datetime.now(ZoneInfo('Europe/Moscow')).strftime('%H:%M')}")
+            print(f"Обновлены данные: BTC={current_price}, Fear={fear_greed}, Liq={liq}, Vol={volatility}, Bollinger={bollinger_signal}, Время={datetime.now(ZoneInfo('Europe/Moscow')).strftime('%H:%M')}")
             return float(current_price), int(fear_greed), float(usdt + usdc), float(dxy), float(liq), volatility, bollinger_signal
         except Exception as e:
-            print(f"Attempt {attempt + 1} failed: {e}")
+            error_msg = f"Ошибка при получении данных (попытка {attempt + 1}/{max_retries + 1}): {str(e)}"
+            print(error_msg)
             if attempt == max_retries:
-                print(f"Max retries reached, using default")
+                print(f"Максимум попыток исчерпан, используется заглушка")
+                send_error_message(error_msg)
                 return 115740, 50, 100000000000, 100.0, 1000000, 0.0, 0  # Заглушка
             time.sleep(1)
+            continue
+
+# Отправка сообщения об ошибке
+def send_error_message(error_msg):
+    subscribers = load_subscribers()
+    for chat_id in subscribers:
+        bot.send_message(chat_id, f"⚠️ Ошибка: {error_msg}. Прогноз временно недоступен.")
 
 # Прогнозирование цены
 def predict_price():
@@ -84,11 +93,11 @@ def predict_price():
     total_weight = 0.0
 
     factors = {
-        'volatility_factor': (0.25 * (-1 if volatility > 0.02 else 1), 0.25),  # Точность ~70% (исследования CoinGecko)
-        'liquidation': (0.20 * (-1 if liq > 2000000 else 1), 0.20),  # Точность ~68% (CoinGlass данные)
+        'volatility_factor': (0.25 * (-1 if volatility > 0.02 else 1), 0.25),  # Точность ~70% (CoinGecko)
+        'liquidation': (0.20 * (-1 if liq > 2000000 else 1), 0.20),  # Точность ~68% (CoinGlass)
         'dxy_factor': (0.20 * (-1 if dxy > 101 else 1), 0.20),  # Точность ~65% (Alpha Vantage)
         'fear_factor': (0.15 * (-fear_greed / 100), 0.15),  # Точность ~67% (Alternative.me)
-        'bollinger_signal': (0.20 * bollinger_signal, 0.20)  # Точность ~65-70% (CoinGecko свечи)
+        'bollinger_signal': (0.20 * bollinger_signal, 0.20)  # Точность ~65-70% (CoinGecko)
     }
 
     # Адаптация весов
@@ -105,7 +114,7 @@ def predict_price():
     forecast = base_forecast / btc if total_weight else 0.0
     return btc + forecast * btc
 
-# Формирование прогноза с московским временем и текущей ценой
+# Формирование прогноза с отдельным временем и ценой на русском
 def get_forecast():
     current_price, _, _, _, _, _, _ = get_data()  # Свежие данные
     price = predict_price()
@@ -115,7 +124,7 @@ def get_forecast():
     h24 = price * 1.025
     rec = "🟢 Лонг" if price > current_price else "🔴 Шорт" if price < current_price * 0.99 else "⚪ Ждать"
     timestamp = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%H:%M")
-    return f"Прогноз BitcoinOracle ({timestamp}, Current BTC: ~{int(current_price)} USD):\n1ч: ~{int(h1)} USD ±400\n3ч: ~{int(h3)} USD ±900\n6ч: ~{int(h6)} USD ±1600\n24ч: ~{int(h24)} USD ±3000\n{rec}"
+    return f"Прогноз BitcoinOracle\nВремя: {timestamp} (Москва)\nТекущая цена BTC: ~{int(current_price)} USD\n1 час: ~{int(h1)} USD ±400\n3 часа: ~{int(h3)} USD ±900\n6 часов: ~{int(h6)} USD ±1600\n24 часа: ~{int(h24)} USD ±3000\nРекомендация: {rec}"
 
 # Отправка прогноза
 def send_forecast():
